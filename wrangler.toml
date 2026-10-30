@@ -1,0 +1,11 @@
+name = "vodomat-staff-bot"
+main = "index.js"
+compatibility_date = "2026-08-26"
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "vodomat-db"
+database_id = "4fc02df4-3fa2-4497-ae04-a1cdac8ac1ed"
