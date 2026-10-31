@@ -1,0 +1,1709 @@
+/**
+ * Telegram-бот для СОТРУДНИКОВ и ВЛАДЕЛЬЦЕВ (3-й Worker: vodomat-staff-bot)
+ * Работает с той же базой Cloudflare D1 (DB), что и основной бот.
+ * 
+ * ИЗМЕНЕНИЯ:
+ * - Автоматический вход отключён: вход строго по 6-значному коду доступа!
+ * - Добавлено красивое приветственное письмо на /start;
+ * - Добавлено постоянное нижнее меню (Reply Keyboard) для сотрудников и владельцев.
+ */
+
+const APP_URL = "https://vodomat-staff-bot.lomakindaniil2005.workers.dev/app";
+
+// Список команд (кнопка «/») и кнопка меню слева от поля ввода, открывающая приложение
+async function setupBotUi(env, chatId) {
+  const call = async (method, body) => {
+    const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!j.ok) console.error(`${method} failed: ${JSON.stringify(j)}`);
+  };
+  const menu_button = { type: "web_app", text: "Приложение", web_app: { url: APP_URL } };
+  await call("setMyCommands", { commands: [
+    { command: "start", description: "Запуск бота" },
+    { command: "menu", description: "Главное меню" },
+    { command: "app", description: "Открыть приложение" },
+    { command: "code", description: "Ввести код доступа" }
+  ] });
+  await call("setChatMenuButton", { menu_button });                       // для всех
+  if (chatId) await call("setChatMenuButton", { chat_id: Number(chatId), menu_button }); // для этого чата сразу
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === "/app") {
+      return new Response(MINIAPP_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
+    }
+    if (request.method === "POST" && url.pathname.startsWith("/api/")) {
+      try { return await handleApi(request, env, url.pathname); }
+      catch (err) { console.error(`API error: ${err && err.stack ? err.stack : String(err)}`); return new Response(JSON.stringify({ error: "server error" }), { status: 500, headers: { "content-type": "application/json" } }); }
+    }
+    if (request.method !== "POST") {
+      return new Response("ok — этот адрес принимает только Telegram webhook", { status: 200 });
+    }
+    const secretHeader = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+    if (!env.TELEGRAM_WEBHOOK_SECRET || secretHeader !== env.TELEGRAM_WEBHOOK_SECRET) {
+      return new Response("forbidden", { status: 403 });
+    }
+    let update;
+    try {
+      update = await request.json();
+    } catch (e) {
+      return new Response("bad request", { status: 400 });
+    }
+
+    try {
+      if (await isDuplicateUpdate(env, "e", update.update_id)) {
+        return new Response("ok", { status: 200 });
+      }
+      if (update.message) {
+        await handleMessage(update.message, env);
+      } else if (update.callback_query) {
+        await handleCallback(update.callback_query, env);
+      }
+    } catch (err) {
+      console.error(`Error handling update: ${err && err.stack ? err.stack : String(err)}`);
+    }
+    return new Response("ok", { status: 200 });
+  }
+};
+
+// ============================================================
+// База данных (D1): Создание и обновление таблиц
+// ============================================================
+
+async function _ensureEmployeeTablesImpl(env) {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS employee_codes (
+      code TEXT PRIMARY KEY,
+      owner_chat_id TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS employees (
+      employee_chat_id TEXT PRIMARY KEY,
+      owner_chat_id TEXT NOT NULL,
+      name TEXT,
+      assigned_machines TEXT NOT NULL DEFAULT '[]',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS authorized_owners (
+      owner_chat_id TEXT PRIMARY KEY,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS owner_codes (
+      code TEXT PRIMARY KEY,
+      owner_chat_id TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS employee_sessions (
+      chat_id TEXT PRIMARY KEY,
+      data TEXT NOT NULL,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS service_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      owner_chat_id TEXT NOT NULL,
+      employee_chat_id TEXT NOT NULL,
+      employee_name TEXT,
+      machine_id TEXT NOT NULL,
+      machine_name TEXT,
+      filters_changed TEXT NOT NULL DEFAULT '[]',
+      readings TEXT NOT NULL DEFAULT '{}',
+      sanitization TEXT NOT NULL DEFAULT '{}',
+      photos TEXT NOT NULL DEFAULT '[]',
+      meter_photos TEXT NOT NULL DEFAULT '[]',
+      comment TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS employee_issues (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      owner_chat_id TEXT NOT NULL,
+      employee_chat_id TEXT NOT NULL,
+      machine_id TEXT NOT NULL,
+      machine_name TEXT,
+      text TEXT,
+      photos TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'open',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS employee_tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      owner_chat_id TEXT NOT NULL,
+      employee_chat_id TEXT NOT NULL,
+      machine_id TEXT NOT NULL,
+      machine_name TEXT,
+      title TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      completed_at DATETIME
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS filter_stock (
+      owner_chat_id TEXT NOT NULL,
+      machine_id TEXT NOT NULL,
+      filter_id TEXT NOT NULL,
+      filter_name TEXT NOT NULL,
+      stock_qty INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (owner_chat_id, machine_id, filter_id)
+    )
+  `).run();
+}
+
+// Пресеты порогов для автоматического предупреждения
+const YEARLY_KIT_PRESETS = [
+  { keywords: ["5 мкр", "5мкр", "5 микрон"], name: "Полипропилен 5мкр Аквадело", qty: 12, warnAt: 2 },
+  { keywords: ["1 мкр", "1мкр", "1 микрон"], name: "Полипропилен 1мкр Аквадело", qty: 6, warnAt: 1 },
+  { keywords: ["уголь", "сорбент", "кокос"], name: "Уголь кокосовый Сорбент (5.2кг)", qty: 1, warnAt: 0 },
+  { keywords: ["мембран", "vontron"], name: "Мембрана VONTRON 3013-400G", qty: 2, warnAt: 1 },
+  { keywords: ["постуголь", "t33a"], name: "Постуголь NatureWater T33A", qty: 2, warnAt: 1 },
+  { keywords: ["минерализатор", "мв-10"], name: "Минерализатор МВ-10 NatureWater", qty: 2, warnAt: 1 },
+  { keywords: ["уф", "лампа", "15в"], name: "УФ лампа 15W", qty: 1, warnAt: 0 },
+];
+
+function getFilterThreshold(filterName) {
+  const lower = filterName.toLowerCase();
+  for (const item of YEARLY_KIT_PRESETS) {
+    if (item.keywords.some(k => lower.includes(k))) {
+      return item.warnAt;
+    }
+  }
+  return 1;
+}
+
+// ============================================================
+// Обработка текстовых сообщений
+// ============================================================
+
+async function handleMessage(message, env) {
+  await ensureEmployeeTables(env);
+  const chatId = String(message.chat.id);
+  const text = (message.text || "").trim();
+
+  const session = await getSession(env, chatId);
+  const emp = await getEmployee(env, chatId);
+  const isAuthorizedOwner = await isAuthorizedOwnerInDb(env, chatId);
+
+  // Нажатие на кнопки нижнего меню
+  if (text === "🔑 Ввести код доступа") {
+    await clearSession(env, chatId);
+    await setSession(env, chatId, { step: "enter_code" });
+    await sendMessage(env, chatId, "🔑 <b>Введите 6-значный код доступа:</b>\n\n• Сотрудникам: код выдаёт владелец.\n• Владельцам: введите ваш Telegram ID из главного бота.", { parse_mode: "HTML" });
+    return;
+  }
+
+  if (text === "🚰 Мои водоматы") {
+    if (emp) await sendEmployeeMainMenu(env, chatId, emp);
+    else if (isAuthorizedOwner) await sendOwnerMainMenu(env, chatId);
+    else await sendWelcomeMessage(env, chatId);
+    return;
+  }
+
+  if (text === "👷 Сотрудники" && isAuthorizedOwner) {
+    await handleCallback({ message, data: "owner:list_emp", id: "0" }, env);
+    return;
+  }
+
+  if (text === "📦 Склад фильтров" && isAuthorizedOwner) {
+    await handleCallback({ message, data: "owner:stock_menu", id: "0" }, env);
+    return;
+  }
+
+  if (text === "📋 Активные задания" && isAuthorizedOwner) {
+    await handleCallback({ message, data: "owner:all_tasks", id: "0" }, env);
+    return;
+  }
+
+  if (text === "🔑 Код сотрудника" && isAuthorizedOwner) {
+    await handleCallback({ message, data: "owner:add_code", id: "0" }, env);
+    return;
+  }
+
+  if (text === "📋 Мои задания" && emp) {
+    const { results } = await env.DB.prepare("SELECT * FROM employee_tasks WHERE employee_chat_id = ? AND status = 'pending' ORDER BY created_at DESC").bind(chatId).all();
+    if (!results.length) {
+      await sendMessage(env, chatId, "📋 У вас нет активных заданий.", { keyboard: employeeReplyKeyboard() });
+      return;
+    }
+    let txt = "📋 <b>Ваши активные задания:</b>\n\n";
+    for (const t of results) {
+      txt += `▪️ <b>${t.machine_name}</b>: ${t.title}\n`;
+    }
+    await sendMessage(env, chatId, txt, { parse_mode: "HTML", keyboard: employeeReplyKeyboard() });
+    return;
+  }
+
+  if (text === "🔄 Главное меню") {
+    if (emp) await sendEmployeeMainMenu(env, chatId, emp);
+    else if (isAuthorizedOwner) await sendOwnerMainMenu(env, chatId);
+    else await sendWelcomeMessage(env, chatId);
+    return;
+  }
+
+  if (text.startsWith("/menu")) {
+    if (emp) await sendEmployeeMainMenu(env, chatId, emp);
+    else if (isAuthorizedOwner) await sendOwnerMainMenu(env, chatId);
+    else await sendWelcomeMessage(env, chatId);
+    return;
+  }
+
+  if (text === "📱 Приложение" || text.startsWith("/app")) {
+    await setupBotUi(env, chatId).catch(e => console.error("setupBotUi: " + e));
+    await sendMessage(env, chatId, "📱 <b>Мини-приложение «Водомат Сервис»</b>", {
+      parse_mode: "HTML",
+      inline_keyboard: [[{ text: "📱 Открыть приложение", web_app: { url: APP_URL } }]]
+    });
+    return;
+  }
+
+  if (text.startsWith("/code")) {
+    await clearSession(env, chatId);
+    await setSession(env, chatId, { step: "enter_code" });
+    await sendMessage(env, chatId, "🔑 <b>Введите 6-значный код доступа:</b>", { parse_mode: "HTML" });
+    return;
+  }
+
+  if (text.startsWith("/start")) {
+    await clearSession(env, chatId);
+    await setupBotUi(env, chatId).catch(e => console.error("setupBotUi: " + e));
+
+    if (emp) {
+      await sendEmployeeMainMenu(env, chatId, emp);
+      return;
+    }
+
+    if (isAuthorizedOwner) {
+      await sendOwnerMainMenu(env, chatId);
+      return;
+    }
+
+    // Новый или незарегистрированный пользователь -> Отправляем Приветственное Письмо
+    await sendWelcomeMessage(env, chatId);
+    return;
+  }
+
+  // Если пользователь отправляет просто 6-значное число вне сессии — пробуем его как код
+  if (!session && /^\d{5,12}$/.test(text)) {
+    await processAccessCode(env, chatId, text, message.from.first_name || "Пользователь");
+    return;
+  }
+
+  if (session) {
+    if (session.step === "enter_code") {
+      await processAccessCode(env, chatId, text, message.from.first_name || "Пользователь");
+      return;
+    }
+
+    if (session.step === "owner_create_task_text") {
+      if (!text) {
+        await sendMessage(env, chatId, "Напишите текст задания.");
+        return;
+      }
+      const { empChatId, machineId, machineName } = session;
+      await env.DB.prepare(`
+        INSERT INTO employee_tasks (owner_chat_id, employee_chat_id, machine_id, machine_name, title, status)
+        VALUES (?, ?, ?, ?, ?, 'pending')
+      `).bind(chatId, empChatId, machineId, machineName, text).run();
+
+      const empObj = await getEmployee(env, empChatId);
+      await clearSession(env, chatId);
+
+      await sendMessage(env, chatId, `✅ Задание для ${empObj ? empObj.name : "сотрудника"} создано!`, {
+        keyboard: ownerReplyKeyboard(),
+        inline_keyboard: [[{ text: "🔙 Назад в меню", callback_data: "owner:menu" }]]
+      });
+
+      try {
+        await sendMessage(env, empChatId, 
+          `📋 <b>Вам выдано новое задание!</b>\n\n` +
+          `🚰 Водомат: <b>${machineName}</b>\n` +
+          `📝 Задание: ${text}`,
+          { parse_mode: "HTML", keyboard: employeeReplyKeyboard() }
+        );
+      } catch (e) {}
+      return;
+    }
+
+    if (session.step === "owner_set_stock_qty") {
+      const qty = parseInt(text, 10);
+      if (isNaN(qty) || qty < 0) {
+        await sendMessage(env, chatId, "Введите целое число (например: 12).");
+        return;
+      }
+      await env.DB.prepare(`
+        INSERT INTO filter_stock (owner_chat_id, machine_id, filter_id, filter_name, stock_qty)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(owner_chat_id, machine_id, filter_id) DO UPDATE SET stock_qty = excluded.stock_qty
+      `).bind(chatId, session.machine_id, session.filter_id, session.filter_name, qty).run();
+
+      await clearSession(env, chatId);
+      await sendMessage(env, chatId, `✅ Остаток фильтра «<b>${session.filter_name}</b>» установлен: <b>${qty} шт.</b>`, {
+        parse_mode: "HTML",
+        keyboard: ownerReplyKeyboard(),
+        inline_keyboard: [[{ text: "🔙 К складу фильтров", callback_data: `owner:stock_m:${session.machine_id}` }]]
+      });
+      return;
+    }
+
+    if (session.step === "enter_readings") {
+      const bits = text.split(/\s+/);
+      const water = parseFloat((bits[0] || "").replace(",", "."));
+      const elec = parseFloat((bits[1] || "").replace(",", "."));
+      if (isNaN(water) || isNaN(elec)) {
+        await sendMessage(env, chatId, "⚠️ Напишите два числа через пробел (вода и свет).\nПример: 120.5 450");
+        return;
+      }
+      session.readings = { water, elec };
+      session.step = "meter_photos";
+      session.meter_photos = [];
+      await setSession(env, chatId, session);
+      await sendMessage(env, chatId, "📸 <b>Теперь обязательно прикрепите ФОТО СЧЁТЧИКОВ (вода и свет):</b>\nОтправьте фото, а затем напишите «Готово».");
+      return;
+    }
+
+    if (session.step === "meter_photos") {
+      if (/^готово$|^нет$/i.test(text)) {
+        if (!session.meter_photos || !session.meter_photos.length) {
+          await sendMessage(env, chatId, "⚠️ Пожалуйста, прикрепите хотя бы 1 фото счётчика для фиксации показаний!");
+          return;
+        }
+        session.step = "service_draft";
+        await setSession(env, chatId, session);
+        await sendMessage(env, chatId, `✅ Фото счётчиков сохранены (${session.meter_photos.length} шт.).`);
+        await sendServiceDraftMenu(env, chatId, session);
+        return;
+      }
+    }
+
+    if (session.step === "issue_text") {
+      session.issue_text = text;
+      session.step = "issue_photos";
+      await setSession(env, chatId, session);
+      await sendMessage(env, chatId, "📷 Пришлите фото поломки/проблемы (если есть), а когда закончите — напишите «Готово».");
+      return;
+    }
+
+    if (session.step === "issue_photos") {
+      if (/^готово$|^нет$/i.test(text)) {
+        await finalizeIssueReport(env, chatId, session);
+        return;
+      }
+    }
+
+    if (session.step === "service_photos") {
+      if (/^готово$|^нет$/i.test(text)) {
+        session.step = "service_draft";
+        await setSession(env, chatId, session);
+        await sendServiceDraftMenu(env, chatId, session);
+        return;
+      }
+    }
+  }
+
+  // Прием фото
+  if (message.photo && message.photo.length && session) {
+    const largestPhoto = message.photo[message.photo.length - 1].file_id;
+
+    if (session.step === "meter_photos") {
+      session.meter_photos = session.meter_photos || [];
+      session.meter_photos.push(largestPhoto);
+      await setSession(env, chatId, session);
+      await sendMessage(env, chatId, `✅ Фото счётчика прикреплено (${session.meter_photos.length} шт.). Ещё фото или напишите «Готово».`);
+      return;
+    }
+
+    if (session.step === "service_photos") {
+      session.photos = session.photos || [];
+      session.photos.push(largestPhoto);
+      await setSession(env, chatId, session);
+      await sendMessage(env, chatId, `✅ Фото добавлены (${session.photos.length} шт.). Ещё фото или напишите «Готово».`);
+      return;
+    }
+
+    if (session.step === "issue_photos") {
+      session.photos = session.photos || [];
+      session.photos.push(largestPhoto);
+      await setSession(env, chatId, session);
+      await sendMessage(env, chatId, `✅ Фото проблемы прикреплено. Ещё фото или напишите «Готово».`);
+      return;
+    }
+  }
+
+  await sendMessage(env, chatId, "Нажмите /start или введите код доступа.");
+}
+
+// ============================================================
+// Приветственное письмо и Клавиатуры
+// ============================================================
+
+async function sendWelcomeMessage(env, chatId) {
+  const welcomeText =
+    "👋 <b>Добро пожаловать в «Водомат Сервис»!</b>\n\n" +
+    "Данный бот предназначен для <b>сотрудников</b> и <b>владельцев водоматов</b>:\n\n" +
+    "🛠 <b>Сотрудникам:</b>\n" +
+    "• Фиксация обслуживания и замен фильтров;\n" +
+    "• Ввод показаний и фото счётчиков;\n" +
+    "• Получение и отметка выполнения заданий;\n" +
+    "• Сообщения о поломках с фотографиями.\n\n" +
+    "👑 <b>Владельцам:</b>\n" +
+    "• Автоматический учёт склада и списание картриджей;\n" +
+    "• Выдача заданий и контроль работы сотрудников;\n" +
+    "• Мгновенные фотоотчёты после каждого обслуживания.\n\n" +
+    "🔑 <b>Вход осуществляется только по коду доступа:</b>\n" +
+    "Введите 6-значный код, который вам передал руководитель, или нажмите кнопку ниже 👇";
+
+  await sendMessage(env, chatId, welcomeText, {
+    parse_mode: "HTML",
+    keyboard: unauthReplyKeyboard(),
+    inline_keyboard: [
+      [{ text: "🔑 Ввести код доступа", callback_data: "role:enter_code" }]
+    ]
+  });
+}
+
+function unauthReplyKeyboard() {
+  return [
+    ["🔑 Ввести код доступа"]
+  ];
+}
+
+function employeeReplyKeyboard() {
+  return [
+    ["🚰 Мои водоматы", "📋 Мои задания"],
+    ["📱 Приложение", "🔄 Главное меню"]
+  ];
+}
+
+function ownerReplyKeyboard() {
+  return [
+    ["👷 Сотрудники", "📦 Склад фильтров"],
+    ["📋 Активные задания", "🔑 Код сотрудника"],
+    ["📱 Приложение", "🔄 Главное меню"]
+  ];
+}
+
+// ============================================================
+// Обработка Callback-кнопок
+// ============================================================
+
+async function handleCallback(callback, env) {
+  await ensureEmployeeTables(env);
+  const chatId = String(callback.message.chat.id);
+  const messageId = callback.message.message_id;
+  const data = callback.data || "";
+
+  // Если вызов пришёл с кнопки нижнего меню (id "0"), редактировать нечего:
+  // message — это сообщение самого пользователя, его бот изменить не может. Шлём новое сообщение.
+  const fromReplyKeyboard = callback.id === "0";
+  const edit = (text, keyboard) => fromReplyKeyboard
+    ? sendMessage(env, chatId, text, { parse_mode: "HTML", inline_keyboard: keyboard })
+    : editMessageText(env, chatId, messageId, text, { parse_mode: "HTML", inline_keyboard: keyboard });
+
+  if (data === "role:enter_code") {
+    await answerCallback(env, callback.id);
+    await setSession(env, chatId, { step: "enter_code" });
+    await edit("🔑 <b>Введите 6-значный код доступа:</b>\n\nНапишите код от вашего руководителя сообщением.", []);
+    return;
+  }
+
+  // Меню Владельца
+  if (data === "owner:menu") {
+    await answerCallback(env, callback.id);
+    await sendOwnerMainMenu(env, chatId, messageId);
+    return;
+  }
+
+  if (data === "owner:add_code") {
+    await answerCallback(env, callback.id);
+    const code = await createEmployeeCode(env, chatId);
+
+    await edit(
+      `🔑 <b>Код подключения сотрудника:</b>\n\n` +
+      `<code>${code}</code>\n\n` +
+      `Передайте этот код сотруднику. Он должен запустить этого бота и ввести данный код.\n⏳ Код действует 24 часа и подходит один раз.`,
+      [[{ text: "🔙 Назад", callback_data: "owner:menu" }]]
+    );
+    return;
+  }
+
+  if (data === "owner:stock_menu") {
+    await answerCallback(env, callback.id);
+    const mainUser = await getMainDbUser(env, chatId);
+    const machines = mainUser.machines || [];
+
+    if (!machines.length) {
+      await edit("У вас пока нет заведённых водоматов в основном боте.", [[{ text: "🔙 Назад", callback_data: "owner:menu" }]]);
+      return;
+    }
+
+    const rows = machines.map(m => [{
+      text: `📦 Склад: ${m.name}`,
+      callback_data: `owner:stock_m:${m.id}`
+    }]);
+    rows.push([{ text: "🔙 Назад", callback_data: "owner:menu" }]);
+
+    await edit("📦 <b>Управление складом фильтров по водоматам:</b>\nВыберите аппарат, чтобы проверить остатки или загрузить годовой комплект:", rows);
+    return;
+  }
+
+  if (data.startsWith("owner:stock_m:")) {
+    await answerCallback(env, callback.id);
+    const machineId = data.slice("owner:stock_m:".length);
+    const mainUser = await getMainDbUser(env, chatId);
+    const machine = (mainUser.machines || []).find(m => m.id === machineId);
+
+    if (!machine || !machine.filters.length) {
+      await edit("У этого водомата не добавлены фильтры в основном боте.", [[{ text: "🔙 Назад", callback_data: "owner:stock_menu" }]]);
+      return;
+    }
+
+    const { results } = await env.DB.prepare("SELECT * FROM filter_stock WHERE owner_chat_id = ? AND machine_id = ?").bind(chatId, machineId).all();
+    const stockMap = {};
+    for (const r of results) stockMap[r.filter_id] = r.stock_qty;
+
+    let txt = `📦 <b>Запас фильтров — ${machine.name}</b>\n\n`;
+    const rows = [];
+
+    rows.push([{ text: "⚡️ Загрузить 1-годовой комплект", callback_data: `owner:stock_load_preset:${machineId}` }]);
+
+    for (const f of machine.filters) {
+      let defaultQty = 2;
+      const lower = f.name.toLowerCase();
+      if (lower.includes("5 мкр") || lower.includes("5мкр")) defaultQty = 12;
+      else if (lower.includes("1 мкр") || lower.includes("1мкр")) defaultQty = 6;
+      else if (lower.includes("уголь") || lower.includes("сорбент")) defaultQty = 1;
+
+      const currentQty = stockMap[f.id] !== undefined ? stockMap[f.id] : defaultQty;
+      const thresh = getFilterThreshold(f.name);
+      const warning = currentQty <= thresh ? " ⚠️ <b>(Мало! Докупить)</b>" : "";
+
+      txt += `• <b>${f.name}:</b> На складе: <b>${currentQty} шт.</b>${warning}\n`;
+
+      rows.push([{
+        text: `✏️ Изменить остаток: ${f.name}`,
+        callback_data: `owner:set_stock_prompt:${machineId}:${f.id}`
+      }]);
+    }
+
+    rows.push([{ text: "🔙 К списку водоматов", callback_data: "owner:stock_menu" }]);
+    await edit(txt, rows);
+    return;
+  }
+
+  if (data.startsWith("owner:stock_load_preset:")) {
+    await answerCallback(env, callback.id, "Загрузка комплекта...");
+    const machineId = data.slice("owner:stock_load_preset:".length);
+    const mainUser = await getMainDbUser(env, chatId);
+    const machine = (mainUser.machines || []).find(m => m.id === machineId);
+
+    if (machine) {
+      for (const f of machine.filters) {
+        let presetQty = 2;
+        const lower = f.name.toLowerCase();
+        if (lower.includes("5 мкр") || lower.includes("5мкр")) presetQty = 12;
+        else if (lower.includes("1 мкр") || lower.includes("1мкр")) presetQty = 6;
+        else if (lower.includes("уголь") || lower.includes("сорбент")) presetQty = 1;
+        else if (lower.includes("мембран") || lower.includes("vontron")) presetQty = 2;
+        else if (lower.includes("постуголь") || lower.includes("t33a")) presetQty = 2;
+        else if (lower.includes("минерализатор") || lower.includes("мв-10")) presetQty = 2;
+        else if (lower.includes("уф") || lower.includes("лампа")) presetQty = 1;
+
+        await env.DB.prepare(`
+          INSERT INTO filter_stock (owner_chat_id, machine_id, filter_id, filter_name, stock_qty)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(owner_chat_id, machine_id, filter_id) DO UPDATE SET stock_qty = excluded.stock_qty
+        `).bind(chatId, machineId, f.id, f.name, presetQty).run();
+      }
+    }
+
+    await handleCallback({ message: callback.message, data: `owner:stock_m:${machineId}`, id: callback.id }, env);
+    return;
+  }
+
+  if (data.startsWith("owner:set_stock_prompt:")) {
+    await answerCallback(env, callback.id);
+    const [, , machineId, filterId] = data.split(":");
+    const mainUser = await getMainDbUser(env, chatId);
+    const machine = (mainUser.machines || []).find(m => m.id === machineId);
+    const filter = machine ? machine.filters.find(f => f.id === filterId) : null;
+
+    await setSession(env, chatId, {
+      step: "owner_set_stock_qty",
+      machine_id: machineId,
+      filter_id: filterId,
+      filter_name: filter ? filter.name : "Фильтр"
+    });
+
+    await edit(`📦 <b>Укажите оставшееся количество (шт) для «${filter ? filter.name : ""}»:</b>\nНапишите число (например: 12 для 5мкр, 6 для 1мкр, 2 для мембран).`, []);
+    return;
+  }
+
+  if (data === "owner:list_emp") {
+    await answerCallback(env, callback.id);
+    const emps = await getEmployeesByOwner(env, chatId);
+    if (!emps.length) {
+      await edit("👷 У вас пока нет подключённых сотрудников.", [
+        [{ text: "➕ Создать код подключения", callback_data: "owner:add_code" }],
+        [{ text: "🔙 Назад", callback_data: "owner:menu" }]
+      ]);
+      return;
+    }
+    const rows = emps.map(e => [
+      { text: `👷 ${e.name || "Сотрудник"} (${JSON.parse(e.assigned_machines).length} т.)`, callback_data: `owner:emp_manage:${e.employee_chat_id}` }
+    ]);
+    rows.push([{ text: "➕ Создать код для нового сотрудника", callback_data: "owner:add_code" }]);
+    rows.push([{ text: "🔙 Назад", callback_data: "owner:menu" }]);
+    await edit("👷 <b>Управление сотрудниками:</b>", rows);
+    return;
+  }
+
+  if (data.startsWith("owner:emp_manage:")) {
+    await answerCallback(env, callback.id);
+    const empChatId = data.slice("owner:emp_manage:".length);
+    const emp = await getEmployee(env, empChatId);
+    if (!emp) return;
+
+    const mainUser = await getMainDbUser(env, chatId);
+    const machines = mainUser.machines || [];
+    const assignedIds = new Set(JSON.parse(emp.assigned_machines || "[]"));
+
+    const rows = [];
+    rows.push([{ text: "📋 Дать задание сотруднику", callback_data: `owner:add_task_select_m:${empChatId}` }]);
+    rows.push([{ text: "📑 Список заданий сотрудника", callback_data: `owner:emp_tasks:${empChatId}` }]);
+
+    rows.push([{ text: "─── Доступ к водоматам ───", callback_data: "ignore" }]);
+    for (const m of machines) {
+      const isAssigned = assignedIds.has(m.id);
+      rows.push([{
+        text: `${isAssigned ? "✅" : "☐"} ${m.name}`,
+        callback_data: `owner:toggle_m:${empChatId}:${m.id}`
+      }]);
+    }
+
+    rows.push([{ text: "❌ Уволить сотрудника", callback_data: `owner:fire_ask:${empChatId}` }]);
+    rows.push([{ text: "🔙 К списку сотрудников", callback_data: "owner:list_emp" }]);
+
+    await edit(`👷 <b>Сотрудник: ${emp.name}</b>\n\nНастройте доступ к точкам или выдайте задание:`, rows);
+    return;
+  }
+
+  if (data.startsWith("owner:toggle_m:")) {
+    await answerCallback(env, callback.id);
+    const [, , empChatId, machineId] = data.split(":");
+    const emp = await getEmployee(env, empChatId);
+    if (!emp) return;
+
+    let assigned = JSON.parse(emp.assigned_machines || "[]");
+    if (assigned.includes(machineId)) {
+      assigned = assigned.filter(id => id !== machineId);
+    } else {
+      assigned.push(machineId);
+    }
+
+    await env.DB.prepare("UPDATE employees SET assigned_machines = ? WHERE employee_chat_id = ?")
+      .bind(JSON.stringify(assigned), empChatId)
+      .run();
+
+    await handleCallback({ message: callback.message, data: `owner:emp_manage:${empChatId}`, id: callback.id }, env);
+    return;
+  }
+
+  if (data.startsWith("owner:fire_ask:")) {
+    await answerCallback(env, callback.id);
+    const empChatId = data.slice("owner:fire_ask:".length);
+    const emp = await getEmployee(env, empChatId);
+    if (!emp) return;
+
+    await edit(`❓ Вы уверены, что хотите уволить сотрудника <b>${emp.name}</b>? Доступ будет моментально заблокирован.`, [
+      [{ text: "🔥 Да, уволить сотрудника", callback_data: `owner:fire_yes:${empChatId}` }],
+      [{ text: "❌ Отмена", callback_data: `owner:emp_manage:${empChatId}` }]
+    ]);
+    return;
+  }
+
+  if (data.startsWith("owner:fire_yes:")) {
+    await answerCallback(env, callback.id);
+    const empChatId = data.slice("owner:fire_yes:".length);
+    const emp = await getEmployee(env, empChatId);
+    
+    await env.DB.prepare("DELETE FROM employees WHERE employee_chat_id = ?").bind(empChatId).run();
+    await env.DB.prepare("DELETE FROM employee_tasks WHERE employee_chat_id = ? AND status = 'pending'").bind(empChatId).run();
+
+    try {
+      await sendMessage(env, empChatId, "⛔ <b>Ваш доступ отменён руководителем.</b> Вы уволены из системы.");
+    } catch (e) {}
+
+    await edit(`✅ Сотрудник <b>${emp ? emp.name : ""}</b> уволен.`, [[{ text: "🔙 К списку сотрудников", callback_data: "owner:list_emp" }]]);
+    return;
+  }
+
+  // Задания
+  if (data.startsWith("owner:add_task_select_m:")) {
+    await answerCallback(env, callback.id);
+    const empChatId = data.slice("owner:add_task_select_m:".length);
+    const mainUser = await getMainDbUser(env, chatId);
+    const machines = mainUser.machines || [];
+
+    if (!machines.length) {
+      await edit("У вас нет заведённых водоматов.", [[{ text: "🔙 Назад", callback_data: `owner:emp_manage:${empChatId}` }]]);
+      return;
+    }
+
+    const rows = machines.map(m => [{
+      text: `🚰 ${m.name}`,
+      callback_data: `owner:add_task_prompt:${empChatId}:${m.id}`
+    }]);
+    rows.push([{ text: "🔙 Отмена", callback_data: `owner:emp_manage:${empChatId}` }]);
+
+    await edit("🚰 Выберите водомат, для которого даётся задание:", rows);
+    return;
+  }
+
+  if (data.startsWith("owner:add_task_prompt:")) {
+    await answerCallback(env, callback.id);
+    const [, , empChatId, machineId] = data.split(":");
+    const mainUser = await getMainDbUser(env, chatId);
+    const machine = (mainUser.machines || []).find(m => m.id === machineId);
+
+    await setSession(env, chatId, {
+      step: "owner_create_task_text",
+      empChatId,
+      machineId,
+      machineName: machine ? machine.name : ""
+    });
+
+    await edit(`📋 <b>Напишите текстом суть задания для «${machine ? machine.name : ""}»:</b>`, []);
+    return;
+  }
+
+  if (data === "owner:all_tasks" || data.startsWith("owner:emp_tasks:")) {
+    await answerCallback(env, callback.id);
+    const isEmpTasks = data.startsWith("owner:emp_tasks:");
+    const empChatId = isEmpTasks ? data.slice("owner:emp_tasks:".length) : null;
+
+    let query = "SELECT * FROM employee_tasks WHERE owner_chat_id = ? AND status = 'pending' ORDER BY created_at DESC";
+    let params = [chatId];
+
+    if (empChatId) {
+      query = "SELECT * FROM employee_tasks WHERE owner_chat_id = ? AND employee_chat_id = ? AND status = 'pending' ORDER BY created_at DESC";
+      params = [chatId, empChatId];
+    }
+
+    const { results } = await env.DB.prepare(query).bind(...params).all();
+
+    if (!results.length) {
+      await edit("📋 Активных заданий нет.", [[{ text: "🔙 Назад", callback_data: empChatId ? `owner:emp_manage:${empChatId}` : "owner:menu" }]]);
+      return;
+    }
+
+    let txt = "📋 <b>Активные задания:</b>\n\n";
+    const rows = [];
+    for (const t of results) {
+      txt += `▪️ <b>${t.machine_name}</b>\n   Задание: ${t.title}\n\n`;
+      rows.push([{ text: `❌ Отозвать задание: "${t.title.slice(0, 15)}..."`, callback_data: `owner:revoke_task:${t.id}` }]);
+    }
+
+    rows.push([{ text: "🔙 Назад", callback_data: empChatId ? `owner:emp_manage:${empChatId}` : "owner:menu" }]);
+    await edit(txt, rows);
+    return;
+  }
+
+  if (data.startsWith("owner:revoke_task:")) {
+    await answerCallback(env, callback.id);
+    const taskId = data.slice("owner:revoke_task:".length);
+    const task = await env.DB.prepare("SELECT * FROM employee_tasks WHERE id = ?").bind(taskId).first();
+
+    if (task) {
+      await env.DB.prepare("DELETE FROM employee_tasks WHERE id = ?").bind(taskId).run();
+      try {
+        await sendMessage(env, task.employee_chat_id, `ℹ️ Задание по аппарату «<b>${task.machine_name}</b>» было отозвано руководителем.`);
+      } catch (e) {}
+    }
+
+    await edit("✅ Задание успешно отозвано.", [[{ text: "🔙 Назад", callback_data: "owner:menu" }]]);
+    return;
+  }
+
+  // --- СОТРУДНИК: Работа на точке ---
+  if (data.startsWith("emp:m:")) {
+    await answerCallback(env, callback.id);
+    const machineId = data.slice("emp:m:".length);
+    const emp = await getEmployee(env, chatId);
+    if (!emp) return;
+
+    const mainUser = await getMainDbUser(env, emp.owner_chat_id);
+    const machine = (mainUser.machines || []).find(m => m.id === machineId);
+    if (!machine) { await edit("Водомат не найден.", []); return; }
+
+    const { count } = await env.DB.prepare("SELECT COUNT(*) as count FROM employee_tasks WHERE employee_chat_id = ? AND machine_id = ? AND status = 'pending'").bind(chatId, machineId).first();
+
+    await edit(
+      `🚰 <b>${machine.name}</b>\n📍 ${machine.address}\n\nВыберите действие:`,
+      [
+        [{ text: `📋 Задания (${count})`, callback_data: `emp:tasks:${machine.id}` }],
+        [{ text: "🔧 Обслуживание", callback_data: `emp:service_start:${machine.id}` }],
+        [{ text: "⚠️ Сообщить о проблеме / Поломке", callback_data: `emp:issue_start:${machine.id}` }],
+        [{ text: "🕐 История обслуживаний", callback_data: `emp:history:${machine.id}` }],
+        [{ text: "🔙 К списку водоматов", callback_data: "emp:m_list" }]
+      ]
+    );
+    return;
+  }
+
+  if (data === "emp:m_list") {
+    await answerCallback(env, callback.id);
+    const emp = await getEmployee(env, chatId);
+    if (emp) await sendEmployeeMainMenu(env, chatId, emp, messageId);
+    return;
+  }
+
+  if (data.startsWith("emp:tasks:")) {
+    await answerCallback(env, callback.id);
+    const machineId = data.slice("emp:tasks:".length);
+    const { results } = await env.DB.prepare("SELECT * FROM employee_tasks WHERE employee_chat_id = ? AND machine_id = ? AND status = 'pending' ORDER BY created_at DESC").bind(chatId, machineId).all();
+
+    if (!results.length) {
+      await edit("📋 Заданий по этому водомату нет.", [[{ text: "🔙 Назад", callback_data: `emp:m:${machineId}` }]]);
+      return;
+    }
+
+    let txt = "📋 <b>Список заданий:</b>\n\n";
+    const rows = [];
+    for (const t of results) {
+      txt += `🔹 ${t.title}\n\n`;
+      rows.push([{ text: `✅ Выполнено: ${t.title.slice(0, 20)}`, callback_data: `emp:task_done:${t.id}` }]);
+    }
+    rows.push([{ text: "🔙 Назад", callback_data: `emp:m:${machineId}` }]);
+
+    await edit(txt, rows);
+    return;
+  }
+
+  if (data.startsWith("emp:task_done:")) {
+    await answerCallback(env, callback.id);
+    const taskId = data.slice("emp:task_done:".length);
+    const task = await env.DB.prepare("SELECT * FROM employee_tasks WHERE id = ?").bind(taskId).first();
+
+    if (task) {
+      await env.DB.prepare("UPDATE employee_tasks SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(taskId).run();
+
+      const emp = await getEmployee(env, chatId);
+      await sendNotificationToOwner(
+        env, task.owner_chat_id,
+        `✅ <b>Задание выполнено!</b>\n\n` +
+        `🚰 Водомат: <b>${task.machine_name}</b>\n` +
+        `👷 Сотрудник: ${emp ? emp.name : "Сотрудник"}\n` +
+        `📝 Задание: ${task.title}`
+      );
+    }
+
+    await edit("✅ Задание отмечено как выполненное!", [[{ text: "🔙 К водомату", callback_data: `emp:m:${task ? task.machine_id : ""}` }]]);
+    return;
+  }
+
+  // Обслуживание
+  if (data.startsWith("emp:service_start:")) {
+    await answerCallback(env, callback.id);
+    const machineId = data.slice("emp:service_start:".length);
+    const emp = await getEmployee(env, chatId);
+    const mainUser = await getMainDbUser(env, emp.owner_chat_id);
+    const machine = (mainUser.machines || []).find(m => m.id === machineId);
+
+    await setSession(env, chatId, {
+      step: "service_draft",
+      machine_id: machineId,
+      machine_name: machine ? machine.name : "",
+      filters_changed: [],
+      readings: null,
+      photos: [],
+      meter_photos: []
+    });
+
+    await sendServiceDraftMenu(env, chatId, await getSession(env, chatId), messageId);
+    return;
+  }
+
+  if (data === "emp:toggle_filter_menu") {
+    await answerCallback(env, callback.id);
+    const session = await getSession(env, chatId);
+    if (!session) return;
+
+    const emp = await getEmployee(env, chatId);
+    const mainUser = await getMainDbUser(env, emp.owner_chat_id);
+    const machine = (mainUser.machines || []).find(m => m.id === session.machine_id);
+
+    if (!machine || !machine.filters.length) {
+      await sendMessage(env, chatId, "У этого водомата не заведены фильтры.");
+      return;
+    }
+
+    const rows = machine.filters.map(f => {
+      const isSelected = session.filters_changed.includes(f.id);
+      return [{
+        text: `${isSelected ? "✅" : "☐"} ${f.name}`,
+        callback_data: `emp:toggle_f:${f.id}`
+      }];
+    });
+
+    rows.push([{ text: "🔙 Назад в меню обслуживания", callback_data: "emp:back_draft" }]);
+    await edit("🔧 <b>Отметьте фильтры, которые были заменены:</b>\n<i>(Остаток на складе автоматически уменьшится на 1 шт.)</i>", rows);
+    return;
+  }
+
+  if (data.startsWith("emp:toggle_f:")) {
+    await answerCallback(env, callback.id);
+    const filterId = data.slice("emp:toggle_f:".length);
+    const session = await getSession(env, chatId);
+    if (!session) return;
+
+    if (session.filters_changed.includes(filterId)) {
+      session.filters_changed = session.filters_changed.filter(id => id !== filterId);
+    } else {
+      session.filters_changed.push(filterId);
+    }
+
+    await setSession(env, chatId, session);
+    await handleCallback({ message: callback.message, data: "emp:toggle_filter_menu", id: callback.id }, env);
+    return;
+  }
+
+  if (data === "emp:input_readings_prompt") {
+    await answerCallback(env, callback.id);
+    const session = await getSession(env, chatId);
+    session.step = "enter_readings";
+    await setSession(env, chatId, session);
+    await edit("📊 <b>Введите текущие показания счётчиков:</b>\nвода (м³) и свет (кВт·ч) через пробел.\n\nПример: <code>145.2 380</code>", []);
+    return;
+  }
+
+  if (data === "emp:add_photo_prompt") {
+    await answerCallback(env, callback.id);
+    const session = await getSession(env, chatId);
+    session.step = "service_photos";
+    await setSession(env, chatId, session);
+    await edit("📷 <b>Отправьте общий фотоотчёт</b> (чистый корпус, заменённые картриджи).\nПосле отправки всех фото напишите «Готово».", []);
+    return;
+  }
+
+  if (data === "emp:back_draft") {
+    await answerCallback(env, callback.id);
+    const session = await getSession(env, chatId);
+    await sendServiceDraftMenu(env, chatId, session, messageId);
+    return;
+  }
+
+  if (data === "emp:service_finish") {
+    await answerCallback(env, callback.id);
+    const session = await getSession(env, chatId);
+    if (!session) return;
+
+    const emp = await getEmployee(env, chatId);
+    const mainUser = await getMainDbUser(env, emp.owner_chat_id);
+    const machine = (mainUser.machines || []).find(m => m.id === session.machine_id);
+
+    const today = moscowDateString();
+    const lowStockAlerts = [];
+    let mainUserChanged = false;
+
+    if (machine && session.filters_changed.length) {
+      for (const filterId of session.filters_changed) {
+        const filterObj = machine.filters.find(f => f.id === filterId);
+        if (filterObj) {
+          filterObj.last_replacement_date = today;
+          filterObj.last_reminder_sent = null;
+
+          let defaultQty = 2;
+          const lower = filterObj.name.toLowerCase();
+          if (lower.includes("5 мкр") || lower.includes("5мкр")) defaultQty = 12;
+          else if (lower.includes("1 мкр") || lower.includes("1мкр")) defaultQty = 6;
+          else if (lower.includes("уголь") || lower.includes("сорбент")) defaultQty = 1;
+
+          const currentStockRow = await env.DB.prepare(
+            "SELECT stock_qty FROM filter_stock WHERE owner_chat_id = ? AND machine_id = ? AND filter_id = ?"
+          ).bind(emp.owner_chat_id, session.machine_id, filterId).first();
+
+          let currentQty = currentStockRow ? currentStockRow.stock_qty : defaultQty;
+          currentQty = Math.max(0, currentQty - 1);
+
+          await env.DB.prepare(`
+            INSERT INTO filter_stock (owner_chat_id, machine_id, filter_id, filter_name, stock_qty)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(owner_chat_id, machine_id, filter_id) DO UPDATE SET stock_qty = excluded.stock_qty
+          `).bind(emp.owner_chat_id, session.machine_id, filterId, filterObj.name, currentQty).run();
+
+          const thresh = getFilterThreshold(filterObj.name);
+          if (currentQty <= thresh) {
+            lowStockAlerts.push(`⚠️ <b>Запас «${filterObj.name}» снизился до ${currentQty} шт.! Пора докупить к этому водомату.</b>`);
+          }
+        }
+      }
+      mainUserChanged = true;
+    }
+
+    // Показания сотрудника — считаем реальную коммуналку так же, как в основном боте,
+    // и кладём как pending_charge, чтобы владелец увидел сумму в разделе «Коммуналка»,
+    // а не только текстом в уведомлении.
+    let utilityChargeText = "";
+    if (machine && session.readings && machine.utilities) {
+      const u = machine.utilities;
+      const waterDelta = Math.max(0, session.readings.water - (u.water_baseline || 0));
+      const elecDelta = Math.max(0, session.readings.elec - (u.elec_baseline || 0));
+      const waterCost = Math.round(waterDelta * (u.water_tariff || 0) * 100) / 100;
+      const elecCost = Math.round(elecDelta * (u.elec_tariff || 0) * 100) / 100;
+      const total = Math.round((waterCost + elecCost) * 100) / 100;
+
+      u.pending_charge = {
+        water_reading: session.readings.water,
+        elec_reading: session.readings.elec,
+        water_cost: waterCost,
+        elec_cost: elecCost,
+        total,
+        created_at: new Date().toISOString(),
+        entered_by: emp.name || "сотрудник",
+      };
+      utilityChargeText = `💧 <b>К оплате коммуналки: ${total} ₽</b> (вода ${waterCost} ₽, свет ${elecCost} ₽)\n\n`;
+      mainUserChanged = true;
+    }
+
+    if (mainUserChanged) {
+      // Применяем изменения к свежей копии данных владельца с проверкой версии:
+      // если владелец в основном боте менял данные одновременно, его правки не теряются.
+      const pendingCharge = machine && machine.utilities ? machine.utilities.pending_charge : null;
+      const changedFilterIds = [...(session.filters_changed || [])];
+      await mutateMainDbUser(env, emp.owner_chat_id, (fresh) => {
+        const fm = (fresh.machines || []).find((m) => m.id === session.machine_id);
+        if (!fm) return false;
+        for (const fid of changedFilterIds) {
+          const fo = (fm.filters || []).find((f) => f.id === fid);
+          if (fo) {
+            fo.last_replacement_date = today;
+            fo.last_reminder_sent = null;
+          }
+        }
+        if (session.readings && fm.utilities && pendingCharge) fm.utilities.pending_charge = pendingCharge;
+        return true;
+      });
+    }
+
+    const filterNames = machine 
+      ? machine.filters.filter(f => session.filters_changed.includes(f.id)).map(f => f.name)
+      : [];
+
+    await env.DB.prepare(`
+      INSERT INTO service_logs (owner_chat_id, employee_chat_id, employee_name, machine_id, machine_name, filters_changed, readings, sanitization, photos, meter_photos)
+      VALUES (?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)
+    `).bind(
+      emp.owner_chat_id,
+      chatId,
+      emp.name || "Сотрудник",
+      session.machine_id,
+      machine ? machine.name : "",
+      JSON.stringify(filterNames),
+      JSON.stringify(session.readings || {}),
+      JSON.stringify(session.photos || []),
+      JSON.stringify(session.meter_photos || [])
+    ).run();
+
+    let notifyText = `🛠 <b>Отчёт об обслуживании водомата</b>\n\n` +
+      `🚰 Аппарат: <b>${machine ? machine.name : ""}</b>\n` +
+      `👷 Сотрудник: ${emp.name || "Сотрудник"}\n` +
+      `📅 Дата: ${formatDate(today)}\n\n`;
+
+    if (filterNames.length) {
+      notifyText += `🔧 <b>Заменены фильтры:</b>\n• ${filterNames.join("\n• ")}\n\n`;
+    } else {
+      notifyText += `🔧 Фильтры не менялись.\n\n`;
+    }
+
+    if (session.readings) {
+      notifyText += `📊 <b>Показания:</b> Вода: ${session.readings.water} м³, Свет: ${session.readings.elec} кВт·ч (Фото приложено ниже)\n\n`;
+    }
+
+    notifyText += utilityChargeText;
+
+    if (lowStockAlerts.length) {
+      notifyText += lowStockAlerts.join("\n") + "\n\n";
+    }
+
+    notifyText += `📷 Фотоотчёт работы: ${session.photos.length} шт., Фото счётчиков: ${session.meter_photos.length} шт.`;
+
+    const allPhotos = [...(session.meter_photos || []), ...(session.photos || [])];
+    await sendNotificationToOwner(env, emp.owner_chat_id, notifyText, allPhotos);
+
+    await clearSession(env, chatId);
+    await edit("✅ <b>Обслуживание завершено!</b>\nСклад фильтров обновился, а отчёт переданы владельцу.", []);
+    return;
+  }
+
+  if (data.startsWith("emp:issue_start:")) {
+    await answerCallback(env, callback.id);
+    const machineId = data.slice("emp:issue_start:".length);
+    await setSession(env, chatId, {
+      step: "issue_text",
+      machine_id: machineId,
+      photos: []
+    });
+    await edit("⚠️ <b>Опишите проблему/поломку одним сообщением:</b>", []);
+    return;
+  }
+
+  if (data.startsWith("emp:history:")) {
+    await answerCallback(env, callback.id);
+    const machineId = data.slice("emp:history:".length);
+    const { results } = await env.DB.prepare("SELECT * FROM service_logs WHERE machine_id = ? ORDER BY created_at DESC LIMIT 5").bind(machineId).all();
+
+    if (!results.length) {
+      await edit("🕐 История обслуживаний пуста.", [[{ text: "🔙 Назад", callback_data: `emp:m:${machineId}` }]]);
+      return;
+    }
+
+    let txt = "🕐 <b>История обслуживаний:</b>\n\n";
+    for (const r of results) {
+      const filters = JSON.parse(r.filters_changed || "[]");
+      txt += `📅 ${formatDate(r.created_at.slice(0, 10))} — ${r.employee_name}\n`;
+      if (filters.length) txt += `   🔧 Фильтры: ${filters.join(", ")}\n`;
+      txt += `\n`;
+    }
+
+    await edit(txt, [[{ text: "🔙 Назад", callback_data: `emp:m:${machineId}` }]]);
+    return;
+  }
+}
+
+// ============================================================
+// Вспомогательные функции взаимодействия и Проверки Кодов
+// ============================================================
+
+async function processAccessCode(env, chatId, code, defaultName) {
+  // Защита от подбора кода: не больше 5 неверных попыток за 15 минут.
+  if (await tooManyCodeAttempts(env, chatId)) {
+    await sendMessage(env, chatId, "🔒 Слишком много неверных попыток. Попробуйте снова через 15 минут.");
+    return;
+  }
+  // 1. Проверяем код сотрудника (действует 24 часа)
+  const empRow = await env.DB.prepare(
+    "SELECT owner_chat_id FROM employee_codes WHERE code = ? AND created_at > datetime('now', '-1 day')"
+  ).bind(code).first();
+  if (empRow) {
+    await clearCodeAttempts(env, chatId);
+    // Если сотрудник переходит к другому владельцу, старые назначения водоматов сбрасываем.
+    await env.DB.prepare(
+      `INSERT INTO employees (employee_chat_id, owner_chat_id, name, assigned_machines)
+       VALUES (?, ?, ?, '[]')
+       ON CONFLICT(employee_chat_id) DO UPDATE SET
+         assigned_machines = CASE WHEN employees.owner_chat_id != excluded.owner_chat_id THEN '[]' ELSE employees.assigned_machines END,
+         owner_chat_id = excluded.owner_chat_id`
+    ).bind(chatId, empRow.owner_chat_id, defaultName).run();
+
+    await env.DB.prepare("DELETE FROM employee_codes WHERE code = ?").bind(code).run();
+    await clearSession(env, chatId);
+
+    await sendMessage(env, chatId, 
+      "✅ <b>Вы успешно подключены как Сотрудник!</b>\n\nОжидайте, пока владелец назначит вам доступ к водоматам.", 
+      { parse_mode: "HTML", keyboard: employeeReplyKeyboard() }
+    );
+
+    await sendNotificationToOwner(
+      env, empRow.owner_chat_id,
+      `👷 <b>Новый сотрудник подключился!</b>\n\nИмя: ${esc(defaultName)}\nНазначьте ему водоматы в меню «👷 Сотрудники».`
+    );
+    return;
+  }
+
+  // 2. Проверяем, ввёл ли Владелец свой Telegram Chat ID (или ID из основной базы users)
+  const isRealOwnerInUsers = await env.DB.prepare("SELECT 1 FROM users WHERE chat_id = ?").bind(code).first();
+  // Telegram ID работает как пароль только если его вводит сам владелец (chatId совпадает с кодом).
+  const isEnvOwner = env.TELEGRAM_CHAT_ID && String(code) === String(env.TELEGRAM_CHAT_ID) && String(chatId) === String(code);
+
+  if ((isRealOwnerInUsers && String(chatId) === String(code)) || isEnvOwner) {
+    await clearCodeAttempts(env, chatId);
+    await authorizeOwnerInDb(env, chatId);
+    await clearSession(env, chatId);
+    await sendMessage(env, chatId, "👑 <b>Вы успешно авторизованы как Владелец!</b>", { parse_mode: "HTML", keyboard: ownerReplyKeyboard() });
+    await sendOwnerMainMenu(env, chatId);
+    return;
+  }
+
+  await recordCodeFailure(env, chatId);
+  await sendMessage(env, chatId, "❌ Неверный код доступа. Перепроверьте 6-значный код от руководителя или Telegram ID и введите снова:");
+}
+
+async function finalizeIssueReport(env, chatId, session) {
+  const emp = await getEmployee(env, chatId);
+  const mainUser = await getMainDbUser(env, emp ? emp.owner_chat_id : chatId);
+  const machine = (mainUser.machines || []).find(m => m.id === session.machine_id);
+
+  if (emp) {
+    await env.DB.prepare(`
+      INSERT INTO employee_issues (owner_chat_id, employee_chat_id, machine_id, machine_name, text, photos)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).bind(
+      emp.owner_chat_id, chatId, session.machine_id,
+      machine ? machine.name : "", session.issue_text, JSON.stringify(session.photos || [])
+    ).run();
+
+    const notifyText = `🚨 <b>Внимание! Сообщение о проблеме</b>\n\n` +
+      `🚰 Аппарат: <b>${machine ? machine.name : ""}</b>\n` +
+      `👷 Сотрудник: ${emp.name}\n\n` +
+      `💬 <b>Описание:</b>\n${session.issue_text}\n\n` +
+      `📷 Фото: ${session.photos.length} шт.`;
+
+    await sendNotificationToOwner(env, emp.owner_chat_id, notifyText, session.photos);
+  }
+
+  await clearSession(env, chatId);
+  await sendMessage(env, chatId, "✅ Сообщение о проблеме отправлено владельцу.", { keyboard: employeeReplyKeyboard() });
+}
+
+async function sendOwnerMainMenu(env, chatId, editMessageId) {
+  const emps = await getEmployeesByOwner(env, chatId);
+  const { count } = await env.DB.prepare("SELECT COUNT(*) as count FROM employee_tasks WHERE owner_chat_id = ? AND status = 'pending'").bind(chatId).first();
+
+  const text = `👑 <b>Панель Владельца — Сотрудники и Склад</b>\n\n` +
+    `• Подключено сотрудников: <b>${emps.length}</b>\n` +
+    `• Активных заданий в работе: <b>${count}</b>`;
+
+  const keyboard = [
+    [{ text: "👷 Список сотрудников / Права", callback_data: "owner:list_emp" }],
+    [{ text: "📦 Склад фильтров по водоматам", callback_data: "owner:stock_menu" }],
+    [{ text: `📋 Активные задания (${count})`, callback_data: "owner:all_tasks" }],
+    [{ text: "🔑 Создать код для сотрудника", callback_data: "owner:add_code" }]
+  ];
+
+  if (editMessageId) {
+    await editMessageText(env, chatId, editMessageId, text, { parse_mode: "HTML", inline_keyboard: keyboard });
+  } else {
+    await sendMessage(env, chatId, text, { parse_mode: "HTML", keyboard: ownerReplyKeyboard(), inline_keyboard: keyboard });
+  }
+}
+
+async function sendEmployeeMainMenu(env, chatId, emp, editMessageId) {
+  const mainUser = await getMainDbUser(env, emp.owner_chat_id);
+  const assignedIds = new Set(JSON.parse(emp.assigned_machines || "[]"));
+  const machines = (mainUser.machines || []).filter(m => assignedIds.has(m.id));
+
+  if (!machines.length) {
+    const txt = "🚰 <b>Вам пока не назначено ни одного водомата.</b>\nОбратитесь к руководителю.";
+    if (editMessageId) await editMessageText(env, chatId, editMessageId, txt, { parse_mode: "HTML" });
+    else await sendMessage(env, chatId, txt, { parse_mode: "HTML", keyboard: employeeReplyKeyboard() });
+    return;
+  }
+
+  const rows = machines.map(m => [{ text: `🚰 ${m.name}`, callback_data: `emp:m:${m.id}` }]);
+  const txt = "🚰 <b>Ваши назначенные водоматы:</b>";
+
+  if (editMessageId) await editMessageText(env, chatId, editMessageId, txt, { parse_mode: "HTML", inline_keyboard: rows });
+  else await sendMessage(env, chatId, txt, { parse_mode: "HTML", keyboard: employeeReplyKeyboard(), inline_keyboard: rows });
+}
+
+async function sendServiceDraftMenu(env, chatId, session, editMessageId) {
+  const emp = await getEmployee(env, chatId);
+  const mainUser = await getMainDbUser(env, emp ? emp.owner_chat_id : chatId);
+  const machine = (mainUser.machines || []).find(m => m.id === session.machine_id);
+
+  const filtersCount = session.filters_changed.length;
+  const readingsText = session.readings 
+    ? `✅ Внесены (${session.readings.water} м³ / ${session.readings.elec} кВт·ч, фото: ${session.meter_photos ? session.meter_photos.length : 0})` 
+    : "❌ Не внесены";
+  const photosCount = session.photos ? session.photos.length : 0;
+
+  const text = `🔧 <b>Обслуживание — ${machine ? machine.name : ""}</b>\n\n` +
+    `• Замена фильтров: <b>${filtersCount} шт.</b>\n` +
+    `• Показания и фото счётчиков: <b>${readingsText}</b>\n` +
+    `• Общие фото работы: <b>${photosCount} шт.</b>\n\n` +
+    `Заполните пункты и нажмите «Завершить обслуживание»:`;
+
+  const keyboard = [
+    [{ text: `🔧 Отметить замену фильтров (${filtersCount})`, callback_data: "emp:toggle_filter_menu" }],
+    [{ text: `📊 Показания + Фото счётчиков`, callback_data: "emp:input_readings_prompt" }],
+    [{ text: `📷 Добавить общие фото (${photosCount})`, callback_data: "emp:add_photo_prompt" }],
+    [{ text: `✅ Завершить обслуживание`, callback_data: "emp:service_finish" }],
+    [{ text: `🔙 Отмена`, callback_data: `emp:m:${session.machine_id}` }]
+  ];
+
+  if (editMessageId) await editMessageText(env, chatId, editMessageId, text, { parse_mode: "HTML", inline_keyboard: keyboard });
+  else await sendMessage(env, chatId, text, { parse_mode: "HTML", inline_keyboard: keyboard });
+}
+
+// ============================================================
+// Взаимодействие с D1 базой
+// ============================================================
+
+async function authorizeOwnerInDb(env, chatId) {
+  await env.DB.prepare(
+    `INSERT INTO authorized_owners (owner_chat_id) VALUES (?)
+     ON CONFLICT(owner_chat_id) DO NOTHING`
+  ).bind(String(chatId)).run();
+}
+
+async function isAuthorizedOwnerInDb(env, chatId) {
+  const row = await env.DB.prepare("SELECT 1 FROM authorized_owners WHERE owner_chat_id = ?").bind(String(chatId)).first();
+  return !!row;
+}
+
+async function getMainDbUser(env, chatId) {
+  const row = await env.DB.prepare("SELECT data FROM users WHERE chat_id = ?").bind(String(chatId)).first();
+  return row ? JSON.parse(row.data) : { machines: [] };
+}
+
+async function updateMainDbUser(env, chatId, userObj) {
+  await env.DB.prepare(
+    "UPDATE users SET data = ?, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?"
+  ).bind(JSON.stringify(userObj), String(chatId)).run();
+}
+
+async function getEmployee(env, chatId) {
+  return await env.DB.prepare("SELECT * FROM employees WHERE employee_chat_id = ?").bind(String(chatId)).first();
+}
+
+async function getEmployeesByOwner(env, ownerChatId) {
+  const { results } = await env.DB.prepare("SELECT * FROM employees WHERE owner_chat_id = ?").bind(String(ownerChatId)).all();
+  return results;
+}
+
+async function getSession(env, chatId) {
+  const row = await env.DB.prepare("SELECT data FROM employee_sessions WHERE chat_id = ?").bind(String(chatId)).first();
+  return row ? JSON.parse(row.data) : null;
+}
+
+async function setSession(env, chatId, sessionObj) {
+  await env.DB.prepare(
+    `INSERT INTO employee_sessions (chat_id, data, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(chat_id) DO UPDATE SET data = excluded.data, updated_at = CURRENT_TIMESTAMP`
+  ).bind(String(chatId), JSON.stringify(sessionObj)).run();
+}
+
+async function clearSession(env, chatId) {
+  await env.DB.prepare("DELETE FROM employee_sessions WHERE chat_id = ?").bind(String(chatId)).run();
+}
+
+async function sendNotificationToOwner(env, ownerChatId, text, photos = []) {
+  const token = env.MAIN_BOT_TOKEN || env.TELEGRAM_BOT_TOKEN;
+  if (!token) return;
+
+  await tgCall(token, "sendMessage", { chat_id: ownerChatId, text, parse_mode: "HTML" }, "notifyOwner");
+
+  for (const fileId of photos) {
+    try {
+      const resFile = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`);
+      const dataFile = await resFile.json();
+      if (!dataFile.ok) continue;
+
+      const imgRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${dataFile.result.file_path}`);
+      const blob = await imgRes.blob();
+
+      const form = new FormData();
+      form.append("chat_id", String(ownerChatId));
+      form.append("photo", blob, "photo.jpg");
+
+      await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, { method: "POST", body: form });
+    } catch (e) {
+      console.error("Failed to send photo to owner:", e);
+    }
+  }
+}
+
+// ============================================================
+// Вспомогательные функции
+// ============================================================
+
+async function sendMessage(env, chatId, text, options = {}) {
+  const body = { chat_id: chatId, text };
+  if (options.parse_mode) body.parse_mode = options.parse_mode;
+  if (options.inline_keyboard) body.reply_markup = { inline_keyboard: options.inline_keyboard };
+  if (options.keyboard) {
+    body.reply_markup = body.reply_markup || {};
+    body.reply_markup.keyboard = options.keyboard;
+    body.reply_markup.resize_keyboard = true;
+    body.reply_markup.is_persistent = true;
+  }
+  return tgCall(env.TELEGRAM_BOT_TOKEN, "sendMessage", body, "sendMessage");
+}
+
+async function editMessageText(env, chatId, messageId, text, options = {}) {
+  const body = { chat_id: chatId, message_id: messageId, text };
+  if (options.parse_mode) body.parse_mode = options.parse_mode;
+  if (options.inline_keyboard) body.reply_markup = { inline_keyboard: options.inline_keyboard };
+  return tgCall(env.TELEGRAM_BOT_TOKEN, "editMessageText", body, "editMessageText");
+}
+
+async function answerCallback(env, callbackId, text) {
+  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ callback_query_id: callbackId, text: text || "" })
+  });
+}
+
+function moscowDateString() {
+  const now = new Date(Date.now() + 3 * 3600000);
+  return now.toISOString().slice(0, 10);
+}
+
+function formatDate(isoDate) {
+  if (!isoDate) return "неизвестно";
+  const [y, m, d] = isoDate.split("-");
+  return `${d}.${m}.${y}`;
+}
+
+// ============================================================
+// Мини-приложение (Telegram Web App): страница /app и API /api/*
+// ============================================================
+
+async function verifyInitData(initData, token) {
+  const params = new URLSearchParams(initData);
+  const hash = params.get("hash");
+  if (!initData) return { reason: "no_init_data" };
+  if (!token) return { reason: "no_token" };
+  if (!hash) return { reason: "no_hash" };
+  params.delete("hash");
+  const str = [...params.entries()].map(([k, v]) => `${k}=${v}`).sort().join("\n");
+  const enc = new TextEncoder();
+  const hmac = async (key, msg) => new Uint8Array(await crypto.subtle.sign(
+    "HMAC", await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]), enc.encode(msg)));
+  const secret = await hmac(enc.encode("WebAppData"), token);
+  const sig = [...await hmac(secret, str)].map(b => b.toString(16).padStart(2, "0")).join("");
+  if (sig !== hash) return { reason: "bad_hash" };
+  if (Date.now() / 1000 - Number(params.get("auth_date") || 0) > 86400) return { reason: "expired" };
+  const user = params.get("user");
+  return user ? { user: JSON.parse(user) } : { reason: "no_user" };
+}
+
+async function handleApi(request, env, path) {
+  const json = (o, s = 200) => new Response(JSON.stringify(o), { status: s, headers: { "content-type": "application/json" } });
+  let body;
+  try { body = await request.json(); } catch (e) { return json({ error: "bad request" }, 400); }
+  const v = await verifyInitData(body.initData || "", env.TELEGRAM_BOT_TOKEN).catch(() => ({ reason: "error" }));
+  if (!v.user) return json({ error: "unauthorized", reason: v.reason }, 401);
+  const user = v.user;
+
+  await ensureEmployeeTables(env);
+  const chatId = String(user.id);
+  const emp = await getEmployee(env, chatId);
+  const isOwner = !emp && await isAuthorizedOwnerInDb(env, chatId);
+  const role = emp ? "employee" : isOwner ? "owner" : "none";
+  if (role === "none") return json({ role });
+
+  const ownerId = emp ? emp.owner_chat_id : chatId;
+  const all = (await getMainDbUser(env, ownerId)).machines || [];
+  const assigned = emp ? new Set(JSON.parse(emp.assigned_machines || "[]")) : null;
+  const machines = all.filter(m => !assigned || assigned.has(m.id));
+  const action = path.slice("/api/".length);
+  const machine = body.machine_id ? machines.find(m => m.id === body.machine_id) : null;
+
+  if (action === "me") {
+    const q = emp
+      ? env.DB.prepare("SELECT id, machine_id, machine_name, title FROM employee_tasks WHERE employee_chat_id = ? AND status = 'pending' ORDER BY created_at DESC").bind(chatId)
+      : env.DB.prepare("SELECT id, machine_id, machine_name, title FROM employee_tasks WHERE owner_chat_id = ? AND status = 'pending' ORDER BY created_at DESC").bind(chatId);
+    const tasks = (await q.all()).results;
+    const out = { role, machines: machines.map(m => ({ id: m.id, name: m.name, address: m.address })), tasks };
+    if (role === "owner") {
+      out.employees = (await getEmployeesByOwner(env, chatId)).map(e => ({ id: e.employee_chat_id, name: e.name || "Сотрудник", n: JSON.parse(e.assigned_machines || "[]").length }));
+      const st = (await env.DB.prepare("SELECT machine_id, filter_name, stock_qty FROM filter_stock WHERE owner_chat_id = ?").bind(chatId).all()).results;
+      out.stock = st.map(s => ({ machine: (all.find(m => m.id === s.machine_id) || {}).name || "", name: s.filter_name, qty: s.stock_qty }));
+    }
+    return json(out);
+  }
+
+  if (action === "task_done" && emp) {
+    const task = await env.DB.prepare("SELECT * FROM employee_tasks WHERE id = ? AND employee_chat_id = ?").bind(body.id, chatId).first();
+    if (!task) return json({ error: "Задание не найдено" }, 404);
+    await env.DB.prepare("UPDATE employee_tasks SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(task.id).run();
+    await sendNotificationToOwner(env, task.owner_chat_id,
+      `✅ <b>Задание выполнено!</b>\n\n🚰 Водомат: <b>${task.machine_name}</b>\n👷 Сотрудник: ${emp.name || "Сотрудник"}\n📝 Задание: ${task.title}`);
+    return json({ ok: true });
+  }
+
+  if (action === "history" && machine) {
+    const rows = (await env.DB.prepare("SELECT employee_name, filters_changed, created_at FROM service_logs WHERE machine_id = ? ORDER BY created_at DESC LIMIT 5").bind(machine.id).all()).results;
+    return json({ rows: rows.map(r => ({ date: formatDate(r.created_at.slice(0, 10)), who: r.employee_name, filters: JSON.parse(r.filters_changed || "[]") })) });
+  }
+
+  // Тяжёлые сценарии (фильтры, показания, фото) остаются в чате — мини-приложение открывает их
+  if (action === "service_start" && emp && machine) {
+    await setSession(env, chatId, { step: "service_draft", machine_id: machine.id, machine_name: machine.name, filters_changed: [], readings: null, photos: [], meter_photos: [] });
+    await sendServiceDraftMenu(env, chatId, await getSession(env, chatId));
+    return json({ ok: true });
+  }
+
+  if (action === "issue_start" && emp && machine) {
+    await setSession(env, chatId, { step: "issue_text", machine_id: machine.id, photos: [] });
+    await sendMessage(env, chatId, "⚠️ <b>Опишите проблему/поломку одним сообщением:</b>", { parse_mode: "HTML" });
+    return json({ ok: true });
+  }
+
+  if (action === "code" && role === "owner") {
+    const code = await createEmployeeCode(env, chatId);
+    return json({ code });
+  }
+
+  if (action === "add_task" && role === "owner" && machine) {
+    const title = String(body.title || "").trim().slice(0, 300);
+    const target = await env.DB.prepare("SELECT * FROM employees WHERE employee_chat_id = ? AND owner_chat_id = ?").bind(String(body.emp_id), chatId).first();
+    if (!title || !target) return json({ error: "Неверные данные" }, 400);
+    await env.DB.prepare("INSERT INTO employee_tasks (owner_chat_id, employee_chat_id, machine_id, machine_name, title) VALUES (?, ?, ?, ?, ?)").bind(chatId, target.employee_chat_id, machine.id, machine.name, title).run();
+    await sendMessage(env, target.employee_chat_id, `📋 <b>Новое задание</b>\n🚰 ${machine.name}\n📝 ${title}`, { parse_mode: "HTML" });
+    return json({ ok: true });
+  }
+
+  return json({ error: "Недоступно" }, 400);
+}
+
+const MINIAPP_HTML = "<!DOCTYPE html>\n<html lang=\"ru\"><head><meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">\n<title>Водомат Сервис</title>\n<script src=\"https://telegram.org/js/telegram-web-app.js\"></script>\n<style>\n:root{--bg:#04121c;--panel:#0b2638;--panel2:#10344c;--line:#1f5575;--tx:#e6f6ff;--hint:#7fa8c2;--a1:#22d3ee;--a2:#2563eb;--lcdbg:#031b24;--lcd:#7dfcf0;--low:#ef4444;--warn:#f59e0b;--ok:#22e58f}\n*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}\nbody{margin:0;color:var(--tx);font:16px/1.4 -apple-system,system-ui,\"Segoe UI\",sans-serif;padding-bottom:calc(30px + env(safe-area-inset-bottom));\nbackground:radial-gradient(ellipse at 50% -10%,#0f3d5c 0,transparent 60%),repeating-linear-gradient(90deg,rgba(255,255,255,.025) 0 2px,transparent 2px 14px),var(--bg);background-attachment:fixed}\n.top{padding:calc(14px + env(safe-area-inset-top)) 14px 0}\n.sign{position:relative;overflow:hidden;border-radius:20px 20px 8px 8px;background:linear-gradient(180deg,#1f6a9c,#0f3a5a);border:2px solid #3b8dc0;box-shadow:0 0 24px rgba(34,211,238,.35),inset 0 2px 0 rgba(255,255,255,.25);padding:14px 16px 16px}\n.sign h1{margin:0;font-size:22px;letter-spacing:.14em;text-transform:uppercase;display:flex;align-items:center;gap:10px;text-shadow:0 0 12px rgba(125,252,240,.85)}\n.sign small{display:block;margin-top:2px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#a8e6ff}\n.chip{display:inline-flex;align-items:center;gap:7px;margin-top:10px;background:var(--lcdbg);border:1px solid #0a3a4d;border-radius:8px;padding:3px 10px;font:12px ui-monospace,Menlo,monospace;color:var(--lcd);box-shadow:inset 0 0 8px #000}\n.chip:before{content:\"\";width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok);animation:bl 1.6s infinite}\n@keyframes bl{50%{opacity:.25}}\n.bub{position:absolute;border-radius:50%;background:rgba(255,255,255,.16);animation:up 7s infinite ease-in}\n.bub:nth-child(1){width:14px;height:14px;left:68%;bottom:-20px}.bub:nth-child(2){width:9px;height:9px;left:80%;bottom:-20px;animation-delay:2s}\n.bub:nth-child(3){width:20px;height:20px;left:88%;bottom:-20px;animation-delay:4s}.bub:nth-child(4){width:8px;height:8px;left:55%;bottom:-20px;animation-delay:1s}\n@keyframes up{to{transform:translateY(-130px);opacity:0}}\nmain{padding:0 14px;position:relative}\n.window{margin-top:10px;border-radius:8px 8px 20px 20px;background:linear-gradient(180deg,#0c2d44,#081c2b);border:2px solid #2b6c92;padding:12px;box-shadow:inset 0 0 20px rgba(0,0,0,.6)}\nh2{margin:22px 4px 9px;font-size:12px;color:var(--hint);text-transform:uppercase;letter-spacing:.16em;display:flex;align-items:center;gap:8px}\nh2:after{content:\"\";flex:1;height:1px;background:linear-gradient(90deg,var(--line),transparent)}\n.stats{display:flex;gap:10px}\n.lcd{flex:1;min-width:0;background:var(--lcdbg);border:2px solid #0a3a4d;border-radius:10px;padding:9px 11px;box-shadow:inset 0 0 14px rgba(0,0,0,.85),0 0 12px rgba(34,211,238,.18)}\n.lcd b{display:block;font:700 26px ui-monospace,Menlo,monospace;color:var(--lcd);text-shadow:0 0 9px rgba(125,252,240,.75)}\n.lcd span{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:#3fa5b5}\n.card{position:relative;background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:16px;padding:13px 15px;margin-bottom:10px;box-shadow:0 6px 16px rgba(0,0,0,.4),inset 0 1px 0 rgba(255,255,255,.08)}\n.row{display:flex;justify-content:space-between;align-items:center;gap:10px}\n.sub{color:var(--hint);font-size:14px}\n.mc{display:flex;gap:13px;align-items:center;cursor:pointer;transition:transform .12s}.mc:active{transform:scale(.97)}\n.mc svg{flex:none}.mc .t{flex:1;min-width:0}.mc b{display:block}.mc .sub{display:block}\n.num{display:inline-block;font:700 11px ui-monospace,Menlo,monospace;background:var(--lcdbg);color:var(--lcd);border:1px solid #0a3a4d;border-radius:5px;padding:0 6px;margin-right:6px;vertical-align:1px}\n.st{flex:none;display:flex;flex-direction:column;align-items:center;gap:3px;font:700 11px ui-monospace,Menlo,monospace;color:var(--ok)}\n.st u{width:14px;height:14px;border-radius:50%;background:currentColor;box-shadow:0 0 10px currentColor;animation:bl 1.6s infinite}\n.st.warn{color:var(--warn)}\nbutton,select,input{font:inherit;width:100%;border:0;border-radius:14px;padding:13px 14px;margin-top:10px}\nbutton{border-radius:30px;padding:12px 14px;color:#04281a;font-weight:800;letter-spacing:.06em;text-transform:uppercase;font-size:14px;background:linear-gradient(180deg,#5cf0b4,#12b57a);box-shadow:0 5px 0 #0a6b48,0 9px 14px rgba(0,0,0,.4);transition:transform .08s,box-shadow .08s}\nbutton:active{transform:translateY(4px);box-shadow:0 1px 0 #0a6b48}\nbutton.blue{color:#021a2c;background:linear-gradient(180deg,#7be8ff,#1aa7e0);box-shadow:0 5px 0 #0b6d96,0 9px 14px rgba(0,0,0,.4)}button.blue:active{box-shadow:0 1px 0 #0b6d96}\nbutton.alt{color:#ffe7b0;background:linear-gradient(180deg,#f59e0b,#c2410c);box-shadow:0 5px 0 #7c2d0a,0 9px 14px rgba(0,0,0,.4)}button.alt:active{box-shadow:0 1px 0 #7c2d0a}\nbutton[disabled]{opacity:.55}\nselect,input{background:var(--lcdbg);color:var(--lcd);border:2px solid #0a3a4d;font-family:ui-monospace,Menlo,monospace;box-shadow:inset 0 0 10px rgba(0,0,0,.8);appearance:none;-webkit-appearance:none}\ninput::placeholder{color:#3fa5b5}\n.tube{height:16px;border-radius:9px;background:var(--lcdbg);border:2px solid #2a6a8a;overflow:hidden;margin-top:9px;box-shadow:inset 0 2px 5px rgba(0,0,0,.8)}\n.tube i{display:block;height:100%;border-radius:6px;position:relative;overflow:hidden;background:linear-gradient(180deg,#67e8f9,#0ea5e9 60%,#2563eb);box-shadow:0 0 10px rgba(34,211,238,.6)}\n.tube i:after{content:\"\";position:absolute;inset:0;background:repeating-linear-gradient(115deg,transparent 0 10px,rgba(255,255,255,.2) 10px 14px);animation:flow 2s linear infinite}\n@keyframes flow{to{background-position:28px 0}}\n.tube.t-low i{background:linear-gradient(180deg,#fca5a5,#ef4444);box-shadow:0 0 10px rgba(239,68,68,.6)}\n.low{color:var(--low)}\n.alert{border-color:var(--low);background:linear-gradient(180deg,#2e1010,#1c0808);box-shadow:0 0 14px rgba(239,68,68,.3);color:#ffb4b4}\n.ticket{border-left:4px dashed var(--warn)}\n.code{font:800 32px ui-monospace,Menlo,monospace;letter-spacing:.2em;text-align:center;margin:6px 0 2px;color:var(--lcd);background:var(--lcdbg);border:2px solid #0a3a4d;border-radius:10px;padding:8px;text-shadow:0 0 12px rgba(125,252,240,.8);box-shadow:inset 0 0 14px #000}\n.log{border-left:4px solid var(--a1)}\n.empty{text-align:center;color:var(--hint);padding:18px}\n.tray{margin:26px auto 0;width:210px;text-align:center;color:var(--hint);font-size:11px;letter-spacing:.14em;text-transform:uppercase}\n.tray .spout{width:26px;height:12px;margin:0 auto;border-radius:0 0 8px 8px;background:linear-gradient(180deg,#5b7f98,#2b4a60)}\n.tray .drip{width:6px;height:9px;margin:2px auto;border-radius:50% 50% 50% 50%/65% 65% 35% 35%;background:var(--a1);box-shadow:0 0 8px var(--a1);animation:dr 2s infinite ease-in}\n@keyframes dr{0%{transform:translateY(-4px);opacity:0}30%{opacity:1}100%{transform:translateY(14px);opacity:0}}\n.tray .slot{height:16px;border-radius:8px;background:#020b11;border:2px solid #2a6a8a;box-shadow:inset 0 3px 8px #000;margin-bottom:6px}\n#toast{position:fixed;left:16px;right:16px;bottom:calc(18px + env(safe-area-inset-bottom));background:var(--lcdbg);color:var(--lcd);border:1px solid #0a3a4d;font-family:ui-monospace,Menlo,monospace;padding:13px;border-radius:14px;display:none;text-align:center;z-index:9;box-shadow:0 0 18px rgba(34,211,238,.35)}\n</style></head><body>\n<div class=\"top\"><div class=\"sign\"><i class=\"bub\"></i><i class=\"bub\"></i><i class=\"bub\"></i><i class=\"bub\"></i>\n<h1><svg width=\"28\" height=\"28\" viewBox=\"0 0 24 24\"><path fill=\"#fff\" d=\"M12 2C12 2 5 10.2 5 15a7 7 0 0014 0C19 10.2 12 2 12 2z\"/></svg>Водомат Сервис</h1><small>Обслуживание аппаратов</small><span class=\"chip\" id=\"chip\">…</span></div></div>\n<main id=\"app\"><div class=\"empty\">Загрузка…</div></main>\n<div class=\"tray\"><div class=\"spout\"></div><div class=\"drip\"></div><div class=\"slot\"></div>Лоток выдачи</div>\n<div id=\"toast\"></div>\n<script>\nconst tg=Telegram.WebApp;tg.ready();tg.expand();\ntry{tg.setHeaderColor(\"#0f3a5a\");tg.setBackgroundColor(\"#04121c\")}catch(e){}\nconst $=s=>document.querySelector(s);\nconst esc=s=>String(s==null?\"\":s).replace(/[&<>\"]/g,c=>({\"&\":\"&amp;\",\"<\":\"&lt;\",\">\":\"&gt;\",'\"':\"&quot;\"}[c]));\nfunction toast(t){const e=$(\"#toast\");e.textContent=t;e.style.display=\"block\";setTimeout(()=>e.style.display=\"none\",2200)}\nasync function api(a,d={}){\n  const r=await fetch(\"/api/\"+a,{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({...d,initData:tg.initData})});\n  const j=await r.json().catch(()=>({error:\"Ошибка\"}));\n  if(!r.ok){const e=new Error(j.error||\"Ошибка\");e.reason=j.reason;throw e}return j;\n}\nconst VM='<svg width=\"46\" height=\"58\" viewBox=\"0 0 46 58\"><rect x=\"2\" y=\"1\" width=\"42\" height=\"56\" rx=\"7\" fill=\"#1f6a9c\" stroke=\"#5fc8f0\" stroke-width=\"1.5\"/><rect x=\"6\" y=\"5\" width=\"34\" height=\"9\" rx=\"2\" fill=\"#031b24\"/><path d=\"M8 10q3-3 6 0t6 0 6 0 6 0\" stroke=\"#7dfcf0\" fill=\"none\" stroke-width=\"1.4\"/><rect x=\"6\" y=\"17\" width=\"23\" height=\"22\" rx=\"3\" fill=\"#0a2b3d\" stroke=\"#2a6a8a\"/><path d=\"M9 30q3-3 6 0t6 0 5 0v6a2 2 0 01-2 2H11a2 2 0 01-2-2z\" fill=\"#22d3ee\"/><circle cx=\"35\" cy=\"21\" r=\"2.6\" fill=\"#a8e6ff\"/><circle cx=\"35\" cy=\"28\" r=\"2.6\" fill=\"#a8e6ff\"/><circle cx=\"35\" cy=\"35\" r=\"2.6\" fill=\"#a8e6ff\"/><rect x=\"6\" y=\"43\" width=\"34\" height=\"10\" rx=\"3\" fill=\"#031b24\"/><path d=\"M23 44.5c0 0-3 3.2-3 5a3 3 0 006 0c0-1.8-3-5-3-5z\" fill=\"#22d3ee\"/></svg>';\nlet S=null,view=\"home\",cur=null;\nconst WHY={no_init_data:\"Telegram не передал данные запуска. Откройте приложение кнопкой «Приложение» слева от поля ввода или командой /app.\",bad_hash:\"Не прошла проверка подписи: токен бота в воркере не совпадает с токеном этого бота.\",expired:\"Сессия устарела. Закройте и откройте приложение заново.\",no_token:\"В воркере не задан TELEGRAM_BOT_TOKEN.\"};\nasync function load(){try{S=await api(\"me\");render()}catch(e){$(\"#app\").innerHTML='<div class=\"card empty\" style=\"margin-top:14px\">'+esc(e.message===\"unauthorized\"?(WHY[e.reason]||\"Откройте приложение из бота в Telegram.\")+\" [\"+(e.reason||\"?\")+\"]\":e.message)+'</div>'}}\nfunction render(){\n  if(S.role===\"none\"){$(\"#chip\").textContent=\"Нет доступа\";$(\"#app\").innerHTML='<div class=\"card empty\" style=\"margin-top:14px\">Доступ не выдан.<br>Вернитесь в чат и введите код доступа.</div>';return}\n  $(\"#chip\").textContent=S.role===\"owner\"?\"👑 Владелец\":\"🛠 Сотрудник\";\n  tg.BackButton[view===\"home\"?\"hide\":\"show\"]();\n  if(view===\"machine\")return renderMachine();\n  S.role===\"owner\"?renderOwner():renderEmp();\n}\ntg.BackButton.onClick(()=>{view=\"home\";render();scrollTo(0,0)});\nfunction machines(){return S.machines.map((m,i)=>{const n=S.tasks.filter(t=>t.machine_id===m.id).length;\n  return `<div class=\"card mc\" data-m=\"${esc(m.id)}\">${VM}<div class=\"t\"><b><span class=\"num\">№${i+1}</span>${esc(m.name)}</b><span class=\"sub\">📍 ${esc(m.address||\"адрес не указан\")}</span></div><div class=\"st ${n?\"warn\":\"\"}\"><u></u>${n||\"ОК\"}</div></div>`}).join(\"\")||'<div class=\"card empty\">Водоматов нет</div>'}\nfunction bindMachines(){document.querySelectorAll(\"[data-m]\").forEach(e=>e.onclick=()=>{cur=e.dataset.m;view=\"machine\";render();scrollTo(0,0)})}\nfunction renderEmp(){\n  $(\"#app\").innerHTML=`<div class=\"window\"><div class=\"stats\"><div class=\"lcd\"><b>${S.machines.length}</b><span>моих водоматов</span></div><div class=\"lcd\"><b>${S.tasks.length}</b><span>активных заданий</span></div></div></div><h2>Мои водоматы</h2>${machines()}`;bindMachines()}\nasync function renderMachine(){\n  const m=S.machines.find(x=>x.id===cur),ts=S.tasks.filter(t=>t.machine_id===cur),idx=S.machines.indexOf(m)+1;\n  $(\"#app\").innerHTML=`<div class=\"card mc\" style=\"cursor:default;margin-top:12px\">${VM}<div class=\"t\"><b><span class=\"num\">№${idx}</span>${esc(m.name)}</b><span class=\"sub\">📍 ${esc(m.address||\"\")}</span></div><div class=\"st ${ts.length?\"warn\":\"\"}\"><u></u>${ts.length||\"ОК\"}</div></div>\n  ${S.role===\"employee\"?`<button id=\"svc\" class=\"blue\">🔧 Начать обслуживание</button><button id=\"iss\" class=\"alt\">⚠️ Сообщить о поломке</button>`:\"\"}\n  <h2>Задания</h2>${ts.map(t=>`<div class=\"card ticket\"><div>${esc(t.title)}</div><button data-done=\"${t.id}\">✅ Выполнено</button></div>`).join(\"\")||'<div class=\"card empty\">Заданий нет 💧</div>'}\n  <h2>История обслуживаний</h2><div id=\"hist\" class=\"sub\">Загрузка…</div>`;\n  document.querySelectorAll(\"[data-done]\").forEach(b=>b.onclick=async()=>{b.disabled=true;try{await api(\"task_done\",{id:b.dataset.done});S.tasks=S.tasks.filter(t=>String(t.id)!==b.dataset.done);toast(\"Готово ✅\");render()}catch(e){toast(e.message);b.disabled=false}});\n  const go=a=>async()=>{try{await api(a,{machine_id:cur});toast(\"Продолжите в чате с ботом\");setTimeout(()=>tg.close(),700)}catch(e){toast(e.message)}};\n  if($(\"#svc\")){$(\"#svc\").onclick=go(\"service_start\");$(\"#iss\").onclick=go(\"issue_start\")}\n  try{const h=await api(\"history\",{machine_id:cur});$(\"#hist\").innerHTML=h.rows.map(r=>`<div class=\"card log\"><b>${esc(r.date)}</b> · ${esc(r.who)}<div class=\"sub\">${r.filters.length?\"🔧 \"+esc(r.filters.join(\", \")):\"Фильтры не менялись\"}</div></div>`).join(\"\")||'<div class=\"card empty\">Пока пусто</div>'}catch(e){$(\"#hist\").textContent=e.message}\n}\nfunction renderOwner(){\n  const low=S.stock.filter(s=>s.qty<=1);\n  $(\"#app\").innerHTML=`<div class=\"window\"><div class=\"stats\"><div class=\"lcd\"><b>${S.employees.length}</b><span>сотрудников</span></div><div class=\"lcd\"><b>${S.tasks.length}</b><span>активных заданий</span></div></div></div>\n  <button id=\"code\" class=\"blue\">🔑 Создать код для сотрудника</button><div id=\"codeOut\"></div>\n  <h2>Водоматы</h2>${machines()}\n  <h2>Сотрудники</h2>${S.employees.map(e=>`<div class=\"card row\"><span>👷 ${esc(e.name)}</span><span class=\"sub\">водоматов: ${e.n}</span></div>`).join(\"\")||'<div class=\"card empty\">Пока никого нет</div>'}\n  ${S.employees.length&&S.machines.length?`<h2>Выдать задание</h2><div class=\"card\"><select id=\"te\">${S.employees.map(e=>`<option value=\"${esc(e.id)}\">${esc(e.name)}</option>`).join(\"\")}</select>\n  <select id=\"tm\">${S.machines.map(m=>`<option value=\"${esc(m.id)}\">${esc(m.name)}</option>`).join(\"\")}</select><input id=\"tt\" placeholder=\"Что нужно сделать\"><button id=\"tb\">Отправить задание</button></div>`:\"\"}\n  <h2>Склад фильтров</h2>${low.length?`<div class=\"card alert\">⚠️ Заканчиваются: ${low.map(s=>esc(s.name)+\" (\"+s.qty+\")\").join(\", \")}</div>`:\"\"}\n  ${S.stock.map(s=>`<div class=\"card\"><div class=\"row\"><span>${esc(s.name)}<div class=\"sub\">${esc(s.machine)}</div></span><b class=\"${s.qty<=1?\"low\":\"\"}\">${s.qty} шт.</b></div><div class=\"tube ${s.qty<=1?\"t-low\":\"\"}\"><i style=\"width:${Math.max(4,Math.min(100,s.qty/12*100))}%\"></i></div></div>`).join(\"\")||'<div class=\"card empty\">Склад не заполнен</div>'}`;\n  bindMachines();\n  $(\"#code\").onclick=async()=>{try{const r=await api(\"code\");$(\"#codeOut\").innerHTML=`<div class=\"card\" style=\"margin-top:10px\"><div class=\"sub\" style=\"text-align:center\">Код для сотрудника</div><div class=\"code\">${esc(r.code)}</div></div>`}catch(e){toast(e.message)}};\n  if($(\"#tb\"))$(\"#tb\").onclick=async()=>{const title=$(\"#tt\").value.trim();if(!title)return toast(\"Напишите задание\");\n    try{await api(\"add_task\",{emp_id:$(\"#te\").value,machine_id:$(\"#tm\").value,title});toast(\"Задание отправлено 💧\");load()}catch(e){toast(e.message)}};\n}\nload();\n</script></body></html>\n";
+
+// ============================================================
+// Хелперы: экранирование, надёжная отправка, дедупликация, коды доступа
+// ============================================================
+
+function esc(str) {
+  return String(str === undefined || str === null ? "" : str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function stripHtmlTags(str) {
+  return String(str)
+    .replace(/<\/?(b|strong|i|em|u|ins|s|strike|del|code|pre|a|tg-spoiler|blockquote)(\s[^>]*)?>/gi, "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+// Вызов Telegram API. Если HTML-разметка не разобрана (в имени или тексте есть "<"),
+// сообщение уходит повторно обычным текстом, чтобы уведомление не потерялось.
+async function tgCall(token, method, body, label) {
+  if (!token) {
+    console.error(`${label}: токен бота не задан`);
+    return false;
+  }
+  const post = (b) =>
+    fetch(`https://api.telegram.org/bot${token}/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(b),
+    });
+  let resp = await post(body);
+  if (resp.ok) return true;
+  const errText = await resp.text();
+  if (resp.status === 400 && body.parse_mode && /can't parse entities|unsupported start tag|can not parse/i.test(errText)) {
+    const plain = { ...body, text: stripHtmlTags(body.text || "") };
+    delete plain.parse_mode;
+    resp = await post(plain);
+    if (resp.ok) return true;
+    console.error(`${label} failed (plain): ${resp.status} ${await resp.text()}`);
+    return false;
+  }
+  if (!/message is not modified/i.test(errText)) console.error(`${label} failed: ${resp.status} ${errText}`);
+  return false;
+}
+
+// Telegram повторяет вебхук при медленном ответе — запоминаем update_id, чтобы не обработать дважды.
+let _updatesTableReady = false;
+async function isDuplicateUpdate(env, kind, updateId) {
+  if (updateId === undefined || updateId === null) return false;
+  try {
+    if (!_updatesTableReady) {
+      await env.DB.prepare(`CREATE TABLE IF NOT EXISTS processed_updates (k TEXT PRIMARY KEY, at INTEGER NOT NULL)`).run();
+      _updatesTableReady = true;
+    }
+    // Обычная вставка: повтор того же update_id нарушит PRIMARY KEY и бросит ошибку.
+    await env.DB.prepare("INSERT INTO processed_updates (k, at) VALUES (?, ?)").bind(`${kind}:${updateId}`, Date.now()).run();
+    return false;
+  } catch (err) {
+    // Дубликатом считаем только нарушение уникальности; любая другая ошибка — не повод молчать.
+    if (/unique|constraint|primary key/i.test(String(err && err.message || err))) return true;
+    console.error("isDuplicateUpdate:", err);
+    return false;
+  }
+}
+
+let _employeeTablesReady = false;
+async function ensureEmployeeTables(env) {
+  if (_employeeTablesReady) return;
+  await _ensureEmployeeTablesImpl(env);
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS code_attempts (chat_id TEXT NOT NULL, at INTEGER NOT NULL)`).run();
+  _employeeTablesReady = true;
+}
+
+// 6-значный код: криптостойкий генератор, срок жизни 24 часа, одноразовый.
+async function createEmployeeCode(env, ownerChatId) {
+  await ensureEmployeeTables(env);
+  await env.DB.prepare("DELETE FROM employee_codes WHERE created_at < datetime('now', '-1 day')").run();
+  for (let i = 0; i < 10; i++) {
+    const code = String(100000 + (crypto.getRandomValues(new Uint32Array(1))[0] % 900000));
+    try {
+      await env.DB.prepare("INSERT INTO employee_codes (code, owner_chat_id) VALUES (?, ?)").bind(code, String(ownerChatId)).run();
+      return code;
+    } catch (err) {
+      if (!/unique|constraint|primary key/i.test(String(err && err.message || err))) throw err;
+      // такой код уже есть — пробуем другой
+    }
+  }
+  throw new Error("не удалось сгенерировать уникальный код");
+}
+
+async function tooManyCodeAttempts(env, chatId) {
+  await ensureEmployeeTables(env);
+  const row = await env.DB.prepare("SELECT COUNT(*) AS c FROM code_attempts WHERE chat_id = ? AND at > ?")
+    .bind(String(chatId), Date.now() - 15 * 60000)
+    .first();
+  return row ? Number(row.c) >= 5 : false;
+}
+
+async function recordCodeFailure(env, chatId) {
+  await env.DB.prepare("INSERT INTO code_attempts (chat_id, at) VALUES (?, ?)").bind(String(chatId), Date.now()).run();
+  await env.DB.prepare("DELETE FROM code_attempts WHERE at < ?").bind(Date.now() - 86400000).run();
+}
+
+async function clearCodeAttempts(env, chatId) {
+  await env.DB.prepare("DELETE FROM code_attempts WHERE chat_id = ?").bind(String(chatId)).run();
+}
+
+// Запись данных владельца (таблица users основного бота) с проверкой версии (_v):
+// при одновременной правке читаем заново и применяем изменение ещё раз.
+async function mutateMainDbUser(env, chatId, mutate) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const row = await env.DB.prepare("SELECT data FROM users WHERE chat_id = ?").bind(String(chatId)).first();
+    if (!row) return false;
+    const user = JSON.parse(row.data);
+    const version = Number(user._v) || 0;
+    if (mutate(user) === false) return false;
+    const nonce = crypto.getRandomValues(new Uint32Array(1))[0].toString(36);
+    user._v = version + 1;
+    user._w = nonce;
+    await env.DB.prepare(
+      "UPDATE users SET data = ?, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ? AND COALESCE(json_extract(data, '$._v'), 0) = ?"
+    )
+      .bind(JSON.stringify(user), String(chatId), version)
+      .run();
+    // Успех проверяем чтением: в строке должна остаться именно наша запись.
+    const check = await env.DB.prepare("SELECT json_extract(data, '$._w') AS w FROM users WHERE chat_id = ?").bind(String(chatId)).first();
+    if (check && check.w === nonce) return true;
+  }
+  throw new Error("mutateMainDbUser: не удалось сохранить из-за конфликта записи");
+}
